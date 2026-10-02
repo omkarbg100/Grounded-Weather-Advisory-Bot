@@ -1,0 +1,34 @@
+# SOP YAML Definition - Travel Category
+# Rationale: YAML allows non-engineers to edit SOPs safely, diffs cleanly in git, and is schema-validated at load time.
+
+- id: TRV-RAIN-PROB-01
+  category: travel
+  title: High Rain Probability Advisory for Travel
+  severity: moderate
+  applies_to: ["travel", "driving", "commute"]
+  when:
+    all:
+      - fact: precip_prob_max
+        op: ">="
+        value: 70
+      - fact: precip_24h_mm
+        op: "<"
+        value: 64.5
+  advice: "RAIN TRAVEL ADVISORY: High precipitation probability of {precip_prob_max}% with estimated rainfall window of {precip_window_mm} mm. Wet roads expected; reduce driving speeds and carry rain gear."
+  tags: ["rain", "travel", "commute"]
+
+- id: TRV-LIGHT-RAIN-01
+  category: travel
+  title: Light Rain Notice for Daily Commute
+  severity: info
+  applies_to: ["commute", "travel", "walking"]
+  when:
+    all:
+      - fact: precip_prob_max
+        op: between
+        value: [30, 69]
+      - fact: precip_window_mm
+        op: "<"
+        value: 10.0
+  advice: "LIGHT RAIN NOTICE: Moderate rain probability ({precip_prob_max}%) with light precipitation expected ({precip_window_mm} mm). Keep a compact umbrella handy for your commute."
+  tags: ["light rain", "commute", "info"]

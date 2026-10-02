@@ -1,0 +1,48 @@
+# SOP YAML Definition - Situational Category
+# Format: Each SOP requires:
+# - id: Unique string identifier (e.g., SIT-RAIN-SYSTEM-01)
+# - category: Category name
+# - title: Short descriptive title
+# - severity: One of info, low, moderate, high, critical
+# - applies_to: List of activity tags or ["*"] for all activities
+# - precedence: Optional 'override' string to bypass normal ranking
+# - when: Nested logical conditions (all / any) with fields: fact, op, value, window
+# - advice: Text template with placeholders like {fact_name}
+# Rationale: YAML allows non-engineers to edit SOPs safely, diffs cleanly in git, and is schema-validated at load time.
+
+- id: SIT-RAIN-SYSTEM-01
+  category: situational
+  title: Severe Rain System / Heavy Rainfall Warning
+  severity: critical
+  applies_to: ["*"]
+  precedence: override
+  when:
+    any:
+      - fact: precip_24h_mm
+        op: ">="
+        value: 64.5
+      - all:
+          - fact: precip_hours_24h
+            op: ">="
+            value: 6
+          - fact: weather_code_max
+            op: in
+            value: [65, 82, 95, 96, 99]
+  advice: "CRITICAL WEATHER WARNING: Heavy rainfall system active with 24h accumulation of {precip_24h_mm} mm over {precip_hours_24h} hours. All outdoor activities should be avoided due to flash flooding risk."
+  tags: ["rain", "flood", "critical", "override"]
+
+- id: SIT-THUNDERSTORM-01
+  category: situational
+  title: Severe Thunderstorm & Lightning Hazard
+  severity: critical
+  applies_to: ["*"]
+  when:
+    any:
+      - fact: has_thunderstorm
+        op: "=="
+        value: 1
+      - fact: weather_code_max
+        op: in
+        value: [95, 96, 99]
+  advice: "THUNDERSTORM WARNING: Lightning and severe thunderstorm activity detected (weather code {weather_code_max}). Seek immediate indoor shelter. Avoid open fields, tall trees, and metallic objects."
+  tags: ["thunderstorm", "lightning", "critical"]

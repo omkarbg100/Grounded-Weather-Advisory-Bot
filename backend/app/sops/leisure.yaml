@@ -1,0 +1,37 @@
+# SOP YAML Definition - Leisure Category (Includes Fuzzy Scoring SOP)
+# Rationale: YAML allows non-engineers to edit SOPs safely, diffs cleanly in git, and is schema-validated at load time.
+
+- id: LEI-PICNIC-01
+  category: leisure
+  title: Outdoor Picnic Suitability Index (Fuzzy Assessment)
+  severity: info
+  applies_to: ["picnic", "outdoor_leisure"]
+  scoring:
+    criteria:
+      - fact: temp_c
+        weight: 0.35
+        op: between
+        value: [18.0, 28.0]
+      - fact: precip_prob_max
+        weight: 0.35
+        op: "<="
+        value: 20
+      - fact: wind_kmh
+        weight: 0.15
+        op: "<="
+        value: 20.0
+      - fact: uv_max
+        weight: 0.15
+        op: "<="
+        value: 7.0
+    bands:
+      - min_score: 0.8
+        label: "Good"
+        advice: "EXCELLENT PICNIC CONDITIONS: Weather parameters are ideal (temp: {temp_c}°C, rain prob: {precip_prob_max}%, wind: {wind_kmh} km/h). Enjoy your outdoor picnic!"
+      - min_score: 0.5
+        label: "Mixed"
+        advice: "MIXED PICNIC CONDITIONS: Weather is acceptable but suboptimal (temp: {temp_c}°C, rain prob: {precip_prob_max}%, wind: {wind_kmh} km/h). Consider sheltered outdoor spots."
+      - min_score: 0.0
+        label: "Poor"
+        advice: "POOR PICNIC CONDITIONS: Unfavorable weather (temp: {temp_c}°C, rain prob: {precip_prob_max}%, wind: {wind_kmh} km/h). Indoor alternatives are recommended."
+  tags: ["picnic", "fuzzy", "leisure"]

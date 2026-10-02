@@ -1,0 +1,69 @@
+# SOP YAML Definition - Exercise Category
+# Rationale: YAML allows non-engineers to edit SOPs safely, diffs cleanly in git, and is schema-validated at load time.
+
+- id: EXE-WIND-CYCLING-01
+  category: exercise
+  title: High Wind Risk for Two-Wheelers and Cycling
+  severity: high
+  applies_to: ["cycling", "cycling_commute", "two_wheeler"]
+  when:
+    any:
+      - fact: wind_kmh
+        op: ">="
+        value: 35.0
+      - fact: max_gust_kmh
+        op: ">="
+        value: 45.0
+  advice: "HIGH WIND WARNING: Sustained wind speeds of {wind_kmh} km/h and gusts up to {max_gust_kmh} km/h make cycling unsafe. Strong crosswinds present severe balance hazards."
+  tags: ["cycling", "wind", "safety"]
+
+- id: EXE-UV-HIGH-01
+  category: exercise
+  title: Severe UV Exposure During Outdoor Exercise
+  severity: high
+  applies_to: ["running", "cycling", "exercise", "sports"]
+  when:
+    all:
+      - fact: uv_max
+        op: ">="
+        value: 8.0
+      - fact: is_daytime_window
+        op: "=="
+        value: 1
+  advice: "HIGH UV WARNING: Peak UV index reaches {uv_max}. Avoid strenuous outdoor exercise between 10:00 and 16:00. If outdoors, apply SPF 50+ sunscreen, wear UV-blocking sunglasses and protective clothing."
+  tags: ["uv", "exercise", "sun protection"]
+
+- id: EXE-HEAT-STRESS-01
+  category: exercise
+  title: Severe Heat Stress for Outdoor Physical Activity
+  severity: high
+  applies_to: ["running", "cycling", "exercise", "sports"]
+  when:
+    any:
+      - fact: feels_like_c
+        op: ">="
+        value: 38.0
+      - fact: temp_c
+        op: ">="
+        value: 38.0
+  advice: "HEAT STRESS ALERT: Apparent temperature reaches {feels_like_c}°C (actual {temp_c}°C). Intense exertion creates high risk of heat exhaustion or heat stroke. Limit workouts or move indoors."
+  tags: ["heat", "exercise", "health"]
+
+- id: EXE-MILD-CONDITIONS-01
+  category: exercise
+  title: Ideal Mild Conditions for Outdoor Exercise
+  severity: info
+  applies_to: ["running", "cycling", "walking", "sports", "commute", "walk"]
+  when:
+    all:
+      - fact: temp_c
+        op: between
+        value: [15.0, 25.0]
+      - fact: precip_prob_max
+        op: "<"
+        value: 20
+      - fact: wind_kmh
+        op: "<"
+        value: 20.0
+  advice: "EXCELLENT CONDITIONS: Current temperature is a comfortable {temp_c}°C with low wind ({wind_kmh} km/h) and minimal rain probability ({precip_prob_max}%). Great weather for outdoor workouts."
+  tags: ["ideal", "exercise", "info"]

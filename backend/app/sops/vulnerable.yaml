@@ -1,0 +1,50 @@
+# SOP YAML Definition - Vulnerable Groups Category
+# Rationale: YAML allows non-engineers to edit SOPs safely, diffs cleanly in git, and is schema-validated at load time.
+
+- id: VUN-CHILDREN-HEAT-01
+  category: vulnerable
+  title: Children Outdoors Heat and UV Safety
+  severity: moderate
+  applies_to: ["children_outdoors", "kids", "play"]
+  when:
+    any:
+      - fact: temp_c
+        op: ">="
+        value: 33.0
+      - fact: uv_max
+        op: ">="
+        value: 6.0
+  advice: "CHILDREN SAFETY NOTICE: High heat ({temp_c}°C) or UV index ({uv_max}). Ensure children stay hydrated, wear hats and sun protection, and take frequent shade breaks during outdoor play."
+  tags: ["children", "heat", "uv"]
+
+- id: VUN-ELDERLY-EXTREME-01
+  category: vulnerable
+  title: Elderly Extreme Temperature Advisory
+  severity: high
+  applies_to: ["elderly_walk", "elderly_outdoors", "walking"]
+  when:
+    any:
+      - fact: temp_c
+        op: ">="
+        value: 36.0
+      - fact: temp_c
+        op: "<="
+        value: 5.0
+  advice: "ELDERLY HEALTH WARNING: Extreme temperature conditions ({temp_c}°C). High thermoregulatory risk for seniors. Minimize unnecessary outdoor exposure and remain in temperature-controlled spaces."
+  tags: ["elderly", "extreme temperature", "health"]
+
+- id: VUN-PET-PAVEMENT-01
+  category: vulnerable
+  title: Pet Hot Pavement and Heat Hazard
+  severity: moderate
+  applies_to: ["dog_walk", "pets", "pet_walking"]
+  when:
+    any:
+      - fact: temp_c
+        op: ">="
+        value: 30.0
+      - fact: feels_like_c
+        op: ">="
+        value: 32.0
+  advice: "PET SAFETY ADVISORY: Air temperature is {temp_c}°C. Asphalt surfaces can reach dangerous temperatures that burn paw pads. Test pavement with your hand for 7 seconds or walk pets on grass."
+  tags: ["pets", "hot pavement", "dog walk"]
