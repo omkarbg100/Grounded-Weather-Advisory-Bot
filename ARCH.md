@@ -230,3 +230,6 @@ tests/                  pytest suites
 ## Current state
 
 Engine, tool layer, guardrails, graph, API and tests are complete and verified offline. The Gemini free-tier quota was exhausted during development (`429 RESOURCE_EXHAUSTED`), so the **live model path has not been exercised end to end** — all verification used a scripted model or the deterministic fallback. Running `python evals/run_evals.py live` is the outstanding step.
+
+
+by Omkar Gaikwad
