@@ -1,10 +1,9 @@
 """
 Gemini client.
 
-Three call shapes:
+Two call shapes:
 
-* `complete_text`      - prose only.
-* `complete_structured`- JSON against a Pydantic model.
+* `complete_text` - prose only, used by the single repair re-prompt.
 * `ToolTurn` / `run_tool_turn` - the agent loop: hand the model the tool
   declarations, let it request tool calls, execute them, feed the results
   back, repeat.
@@ -14,20 +13,16 @@ argument validation, ref minting and state writes all stay on this side of the
 boundary. There is no client-owned fallback classifier: when the model is
 unreachable the caller is told so and takes the deterministic path.
 """
-import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar
+from typing import Any, Dict, List, Optional, Tuple
 
 from google import genai
 from google.genai import types
-from pydantic import BaseModel
 
 from app.config import GEMINI_API_KEY, LLM_MODEL, LLM_TEMPERATURE, LLM_TIMEOUT
 
 logger = logging.getLogger(__name__)
-
-T = TypeVar("T", bound=BaseModel)
 
 DEFAULT_MODEL = "gemini-flash-latest"
 
@@ -96,45 +91,6 @@ def complete_text(prompt: str, system_prompt: str = "") -> str:
     except Exception as exc:
         logger.warning("[Gemini] Text completion failed: %s", exc)
         return ""
-
-
-# --- Structured ---
-
-def complete_structured(prompt: str, response_model: Type[T]) -> Optional[T]:
-    """
-    Structured completion against a Pydantic model.
-
-    Returns None on failure rather than a heuristic guess, so a caller can tell
-    "the model said this" apart from "we made this up".
-    """
-    client = _get_client()
-    if not client:
-        logger.warning("[Gemini] No API key configured.")
-        return None
-
-    schema_json = json.dumps(response_model.model_json_schema(), indent=2)
-    full_prompt = (
-        f"{prompt}\n\n"
-        "Respond ONLY with a valid JSON object strictly matching this JSON Schema.\n"
-        "Do NOT include markdown fences or extra text.\n"
-        f"Schema:\n{schema_json}"
-    )
-
-    try:
-        response = client.models.generate_content(
-            model=get_active_model(),
-            contents=full_prompt,
-            config=types.GenerateContentConfig(
-                temperature=LLM_TEMPERATURE,
-                response_mime_type="application/json",
-                http_options=_http_options(),
-            ),
-        )
-        data = json.loads(_strip_markdown(response.text or ""))
-        return response_model.model_validate(data)
-    except Exception as exc:
-        logger.warning("[Gemini] Structured completion failed: %s", exc)
-        return None
 
 
 # --- Tool-calling turn ---
