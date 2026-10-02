@@ -171,3 +171,6 @@ If the key is missing, rate-limited or offline the service still responds: it re
 The deterministic engine, the tool layer, the guardrails, the graph and the test suite are complete and verified offline (109 tests, 15 eval scenarios).
 
 **The live model path has not yet been exercised end to end.** Everything above was validated against a scripted model because the Gemini free-tier quota was exhausted (`429 RESOURCE_EXHAUSTED`) during development. `python evals/run_evals.py live` is the outstanding check; expect to iterate on tool-argument quality once it can run.
+
+
+by Omkar Gaikwad
