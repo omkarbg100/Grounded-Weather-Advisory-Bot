@@ -1,6 +1,7 @@
 import pytest
 from app.engine.location import parse_coordinates, resolve_location_decision
 from app.engine.facts import derive_facts
+from app.engine.timewindow import resolve_window, WindowResolutionError
 from app.engine.matcher import match_sops
 from app.engine.ranking import resolve_conflicts
 from app.engine.verifier import verify_reply
@@ -72,10 +73,42 @@ def test_derive_facts_this_evening():
             "weather_code": [0] * 24,
         }
     }
-    facts = derive_facts(mock_raw, time_ref="this_evening")
+    facts = derive_facts(mock_raw, time_window="this_evening")
     assert facts["is_daytime_window"] == 0
     # Evening hours 18 to 22: max temp is 20 + 22 = 42
     assert facts["temp_c"] == 42.0
+
+
+def test_resolve_window_by_timestamp_not_assumed_index():
+    """A payload that does not start at local midnight must still resolve."""
+    times = [f"2026-10-01T{h:02d}:00" for h in range(6, 24)]
+    window = resolve_window(times, "this_evening")
+    assert window.start_index == 12   # 18:00 is the 13th entry of a 06:00 start
+    assert times[window.start_index].endswith("T18:00")
+    assert window.is_daytime_window is False
+
+    tomorrow = resolve_window([f"2026-10-0{d}T{h:02d}:00" for d in (1, 2) for h in range(24)], "tomorrow")
+    assert tomorrow.start_index == 24
+    assert tomorrow.end_index == 48
+
+
+def test_resolve_window_custom_iso_bounds():
+    times = [f"2026-10-01T{h:02d}:00" for h in range(24)]
+    window = resolve_window(times, "custom", "2026-10-01T10:00", "2026-10-01T12:00")
+    assert window.start_index == 10
+    assert window.end_index == 13
+
+
+def test_resolve_window_short_payload_degrades():
+    """A 5-hour forecast must not raise; it falls back to what it has."""
+    window = resolve_window([f"2026-10-01T{h:02d}:00" for h in range(5)], "this_evening")
+    assert window.start_index == 0
+    assert window.end_index == 5
+
+
+def test_unknown_window_name_rejected():
+    with pytest.raises(WindowResolutionError):
+        resolve_window(["2026-10-01T00:00"], "next_decade")
 
 
 # --- Matcher Boundary & Fuzzy Tests ---

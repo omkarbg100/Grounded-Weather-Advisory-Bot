@@ -1,172 +1,176 @@
 # Architectural Documentation — Weather-Advisory Support Bot
 
-This document provides a comprehensive architectural breakdown of the **SOP-Grounded Weather-Advisory Support Bot**, detailing the design principles, component boundaries, LangGraph agent structure, deterministic rule engine, security guardrails, and data flow.
+This document describes the implemented architecture of the **SOP-Grounded Weather-Advisory Support Bot**: a Gemini tool-calling agent whose safety advice comes entirely from a deterministic policy engine.
 
 ---
 
 ## 🏢 System Overview & Core Philosophy
 
-The primary objective of this system is to deliver **100% deterministic, policy-grounded outdoor safety advice** using live weather data from Open-Meteo.
+The primary objective is **100% deterministic, policy-grounded outdoor safety advice** using live weather data from Open-Meteo.
 
-### Non-Negotiable Architectural Principles:
-1. **The LLM Never Decides Policy**: All safety advice originates from Standard Operating Procedures (SOPs) written in YAML files. The LLM only handles natural language rephrasing.
-2. **Zero Code Changes for Policy Updates**: Policy maintainers can add, modify, or deprecate SOPs by editing YAML files in `app/sops/` without modifying Python code.
-3. **Fact Grounding & Verification**: All numbers reported to the user (temperatures, wind speeds, rainfall totals) are derived directly from the Open-Meteo API. The LLM output is verified before being returned.
-4. **Resilience & Honest Fallbacks**: If the location cannot be resolved or the weather API is down, the system fails honestly with a plain message. If the LLM is offline or rate-limited, the system seamlessly degrades to deterministic raw SOP advice templates.
+### Non-Negotiable Architectural Principles
+
+1. **The LLM Never Decides Policy.** All safety advice originates from Standard Operating Procedures written in YAML in `app/sops/`. The model chooses *parameters*; the engine chooses *policy*.
+2. **Zero Code Changes for Policy Updates.** New or revised SOPs are a YAML edit. Thresholds, severity ordering, fact definitions, time windows and agent limits all live in `app/policy_config.yaml`.
+3. **Fact Grounding & Verification.** The model never writes weather facts. It receives them from `get_forecast` and passes a server-issued `forecast_ref` to `evaluate_policies`. Every number in the final reply is checked against those facts and the published advice.
+4. **Resilience & Honest Fallbacks.** If the model is unreachable, the graph degrades to deterministic advice quoted verbatim from the SOP text. It never invents data to fill the gap.
 
 ---
 
-## 📐 System Architecture Diagram
+## 📐 Architecture
 
 ```mermaid
 flowchart TD
-    User([User / React Chat UI]) <--> API[FastAPI Web Server /chat]
-    
-    subgraph LangGraph Agent Pipeline
-        API --> Guard[guard_input: PII Scrubbing & Injection Check]
-        Guard --> ExtractCoords[extract_coords: Regex Lat/Lon]
-        ExtractCoords --> ParseIntent[parse_intent: Intent & Taxonomy Parser]
-        
-        ParseIntent --> Router1{Location Router}
-        Router1 -- "Coords Provided" --> FetchWeather[fetch_weather: Open-Meteo API]
-        Router1 -- "City Text" --> Geocode[geocode_city: Open-Meteo Geocoding]
-        Router1 -- "Session Loc" --> FetchWeather
-        Router1 -- "No Loc" --> Clarify[ask_clarification]
-        Router1 -- "Out of Scope" --> NoScope[respond_no_scope]
-        
-        Geocode -- "Success" --> FetchWeather
-        Geocode -- "Fail" --> FailLoc[fail_location]
-        
-        FetchWeather -- "Success" --> BuildFacts[build_facts: Weather Fact Derivation]
-        FetchWeather -- "Fail" --> FailWeather[fail_weather]
-        
-        BuildFacts --> MatchSOPs[match_sops: SOP Rule Evaluator]
-        MatchSOPs --> Router2{Matched SOPs?}
-        Router2 -- "No SOP Applies" --> NoSOP[respond_no_sop]
-        Router2 -- "SOPs Matched" --> ResolveConflicts[resolve_conflicts: Ranking Engine]
-        
-        ResolveConflicts --> ComposeReply[compose_reply: LLM Rephraser]
-        ComposeReply --> VerifyReply[verify_reply: Fact & Citation Verifier]
-        
-        VerifyReply --> Router3{Verification Passed?}
-        Router3 -- "Yes" --> Finalize[finalize: State & Session Memory]
-        Router3 -- "No & Retries < 1" --> ComposeReply
-        Router3 -- "No & Retries >= 1" --> FallbackReply[deterministic_reply]
-        FallbackReply --> Finalize
+    User([Chat UI]) <--> API[FastAPI /chat]
+
+    subgraph Graph["LangGraph — six nodes"]
+        API --> Guard[guard_input]
+        Guard --> Agent[agent_loop]
+        Agent --> Verify[verify_reply]
+        Verify -- "valid" --> Final[finalize]
+        Verify -- "invalid, budget left" --> Repair[repair_reply]
+        Repair --> Verify
+        Verify -- "invalid, budget spent" --> Det[deterministic_reply]
+        Agent -- "LLM unreachable" --> Det
+        Det --> Final
+        Final --> END([END])
     end
-    
-    Finalize --> API
-    NoScope --> API
-    Clarify --> API
-    NoSOP --> API
-    FailLoc --> API
-    FailWeather --> API
+
+    subgraph Tools["Server-side tools"]
+        Agent --> SL[search_location]
+        Agent --> GF[get_forecast]
+        Agent --> EP[evaluate_policies]
+        Agent --> PC[get_policy_catalog]
+        Agent --> ET[end_turn]
+    end
+
+    SL --> Geo[Open-Meteo Geocoding]
+    GF --> Wx[Open-Meteo Forecast]
+    GF --> Facts[derive_facts]
+    EP --> Match[matcher + ranking]
+    ET --> Verify
+
+    subgraph Engine["Deterministic engine"]
+        Facts --> Match
+        Match --> Verify
+    end
 ```
 
----
+### Why six nodes
 
-## 🤖 LangGraph Agent Architecture
+The previous graph had seventeen, split across intent parsing, location resolution, fact derivation and a heuristic structured-output fallback. Almost all of that branching is now the model's job, expressed as tool calls, and the rest is deterministic. What remains is the guard, the loop, the verification gate, one repair, the fallback, and the settle.
 
-The agent is implemented as a stateful graph (`StateGraph`) using **LangGraph** with real conditional branching and session persistence via `MemorySaver`.
+### The trust boundary
 
-### Graph State Schema (`GraphState`)
-The agent state is passed across nodes as a typed dictionary containing:
-- `session_id`: Unique chat session identifier.
-- `message` & `sanitized_message`: Original and sanitized user input.
-- `injection_flag`: Boolean flag indicating detected prompt injection attempts.
-- `coords_candidate`: Optional tuple of parsed `(latitude, longitude)`.
-- `intent`: `IntentParseResult` Pydantic model (`intent_type`, `activity`, `city_text`, `time_ref`).
-- `location`: Resolved `LocationModel` (`lat`, `lon`, `label`, `source`).
-- `raw_weather` & `facts`: API weather payload and derived numerical facts dictionary.
-- `matched_sops`: List of matched SOP objects and rendered advice.
-- `ranking_result`: Primary SOP, secondary SOPs, and combined advice string.
-- `reply`: Generated reply text.
-- `verify_passed` & `verify_retries`: Verification status and retry counter.
-- `outcome`: Terminal outcome state (`answered`, `no_sop`, `location_failed`, `weather_failed`, `clarify`, `out_of_scope`).
+| Layer | Who controls it | What it guarantees |
+|---|---|---|
+| `guard_input` | Server | PII redacted, control chars stripped, injection detected |
+| `agent_loop` | Model | Chooses which tool to call and with what arguments |
+| Tool schemas | Server | Arguments validated by Pydantic before any handler runs |
+| `search_location` / `get_forecast` | Server | Mints `location_ref` / `forecast_ref`; the model cannot invent them |
+| `evaluate_policies` | Server | Matches YAML SOPs against derived facts; `include_ids` narrows, never widens |
+| `verify_reply` | Server | Every cited id must have matched; every number must be supported |
+| `deterministic_reply` | Server | Quotes published advice verbatim |
+
+The model is trusted with intent, not with facts or verdicts.
 
 ---
 
-## 🧩 Comprehensive Node Breakdown (17 Graph Nodes)
+## 🔁 The Agent Loop
 
-| # | Node Name | Category | Primary Function |
-|---|---|---|---|
-| 1 | `guard_input` | Security Middleware | Strips control characters, scrubs PII (emails, phone numbers, IDs), and scans for jailbreaks/prompt injections. |
-| 2 | `extract_coords` | Deterministic Entity Extraction | Uses regex to extract coordinates (`18.616, 74.698`) in 0.01ms with 100% precision. |
-| 3 | `parse_intent` | Intent & Entity Parsing | Calls Gemini API (or keyword fallback) to classify intent type, activity, city, and time window. Handles multi-turn follow-ups. |
-| 4 | `geocode_city_node` | Geocoding Tool | Calls Open-Meteo Geocoding API to resolve city text into `(lat, lon)`. |
-| 5 | `fetch_weather` | Weather Tool | Calls Open-Meteo Forecast API for target coordinates. Includes retry logic and error catching. |
-| 6 | `build_facts` | Fact Engine | Derives window-specific weather facts (`temp_c`, `wind_kmh`, `uv_max`, `precip_window_mm`, `has_thunderstorm`) from raw weather payload. |
-| 7 | `match_sops_node` | Rule Evaluator | Evaluates all loaded SOP YAML rules against the user activity and derived facts. Supports boolean logic (`when`) and fuzzy scoring (`scoring`). |
-| 8 | `resolve_conflicts_node` | Conflict Resolver | Ranks matched SOPs deterministically by Precedence (`override` first) $\rightarrow$ Severity $\rightarrow$ Tie-break. |
-| 9 | `compose_reply` | LLM Rephraser | Invokes Gemini API to rephrase official SOP advice into a friendly response, strictly constrained to cite SOP IDs and use only real numbers. |
-| 10 | `verify_reply_node` | Verifier & Self-Correction | Verifies that all numbers in the reply match API facts/SOP bounds and that cited SOP IDs are valid. |
-| 11 | `deterministic_reply` | Safe Fallback | Generates a 100% deterministic response from raw SOP templates if LLM rephrasing fails verification twice. |
-| 12 | `respond_no_scope` | Terminal Handler | Handles greetings and out-of-scope questions with a polite refusal. |
-| 13 | `ask_clarification` | Terminal Handler | Prompts user for a location when none is provided in message or session memory. |
-| 14 | `respond_no_sop` | Terminal Handler | Responds honestly when weather is retrieved but no SOP rules apply. |
-| 15 | `fail_location` | Terminal Handler | Responds honestly when geocoding fails to resolve a city name. |
-| 16 | `fail_weather` | Terminal Handler | Responds honestly when the Open-Meteo API is unreachable or fails. |
-| 17 | `finalize` | State & Memory | Finalizes outcome payload and saves location & activity into `MemorySaver` for multi-turn session persistence. |
+`app/agent/loop.py` drives a bounded exchange:
+
+1. Build the system prompt from the SOP taxonomy and current config.
+2. Send history and the tool declarations to Gemini.
+3. For each function call: validate arguments, dispatch, append the result as a `function_response` part.
+4. Stop on `end_turn`, on a plain text reply, on `max_steps`, or when a repair turns out to be necessary.
+
+Automatic function calling is **off** (`automatic_function_calling=disabled`). Every tool invocation therefore goes through our validation and dispatch path, and every function response is a part we append ourselves.
+
+### Tools
+
+| Tool | Purpose | Notes |
+|---|---|---|
+| `search_location` | Resolve a place to coordinates | Returns all candidates with server-minted refs; the model disambiguates |
+| `get_forecast` | Fetch conditions and derive facts | Requires a `location_ref` or coordinates; accepts raw coordinates only with the user's own numbers |
+| `evaluate_policies` | Match SOPs against a `forecast_ref` | The only source of guidance |
+| `get_policy_catalog` | List activities and SOP ids | For when the model cannot map the request to a tag |
+| `end_turn` | Report outcome and message | Validated enum; this is how `clarify` / `no_sop` / `out_of_scope` are decided |
+
+### Gemini schema constraints
+
+Gemini rejects `$ref`/`$defs`, `title`, `default` and bare `anyOf` unions in tool declarations. `app/llm/schema_utils.py` inlines refs, drops unsupported keywords and collapses optional-anything unions into `{"type": ..., "nullable": true}`. Bounds are enforced by the Pydantic model and re-clamped from config at dispatch time.
 
 ---
 
-## 🔄 Self-Correction & Verification Loop
+## ⚙️ The Deterministic Engine
 
-The agent includes a feedback loop between `compose_reply` and `verify_reply`:
+| Module | Responsibility |
+|---|---|
+| `engine/fact_registry.py` | The fact contract: name, unit, source, description |
+| `engine/timewindow.py` | Resolves `now` / `today` / `tomorrow` / `this_evening` / `custom` to hour ranges from the reference timestamp |
+| `engine/facts.py` | Derives facts from raw Open-Meteo output for a window |
+| `engine/matcher.py` | SOP matching, with `why` explanations and fuzzy scores |
+| `engine/ranking.py` | Orders matches: precedence, then severity, then id |
+| `engine/verifier.py` | Grounding and citation checks |
+| `engine/policies.py` | Facade used by the tool layer |
+
+### Grounding rules
+
+`verifier.py` builds the set of numbers a reply may contain from:
+
+- values of the derived facts,
+- thresholds in the SOPs that actually matched,
+- numbers appearing in the cited policies' advice text,
+- values interpolated into the rendered advice the model was shown.
+
+Anything else is a violation. SOP ids and clock times are stripped before extraction, so `EXE-WIND-CYCLING-01` is not read as `-1` and "avoid 10:00 to 16:00" does not introduce 10 and 16. There is no blanket constant allowlist; a threshold from a policy that did *not* match is not licensed.
+
+---
+
+## 🛡️ Guardrails
+
+`app/guardrails/` holds YAML-driven rules:
+
+- `patterns.yaml` — PII redaction patterns, injection patterns, control characters, message cap
+- `templates.yaml` — every deterministic user-facing string
+
+Redaction happens before the model sees the text. Injection detection sets a flag, adds an instruction to the system prompt, and never permits the message to override the workflow.
+
+---
+
+## 🔁 Outcomes and Routing
+
+`end_turn(outcome, message)` is validated against a fixed enum: `answered`, `no_sop`, `clarify`, `out_of_scope`, `location_failed`, `weather_failed`. Two further outcomes, `llm_unavailable` and `unavailable`, are set by the graph itself and cannot be claimed by the model.
+
+`finalize` only fills gaps: a missing reply is `unavailable`, and an outcome a node already decided is preserved.
+
+---
+
+## 🧪 Testing and Evaluation
+
+- `pytest tests/` — 109 tests, no network. `ScriptedModel` replays a fixed tool-call sequence and resolves `Ref(...)` placeholders against what the dispatcher actually returned, so a script cannot hard-code a server-minted ref.
+- `python evals/run_evals.py [live|offline]` — golden scenarios from `evals/cases.yaml`, checking invariants that must hold regardless of the model: citations exist, citations matched, numbers supported, refusals numberless, injection ids absent.
+
+Scenarios that can only be observed when the model calls a tool are marked `requires_model: true` and reported as `SKIP` offline rather than counted as passes.
+
+---
+
+## 📁 Layout
 
 ```
-                 ┌──────────────────┐
-                 │  compose_reply   │◄───────────┐
-                 └────────┬─────────┘            │
-                          │                      │
-                          ▼                      │ (Verification failed & retries < 1)
-                 ┌──────────────────┐            │
-                 │   verify_reply   ├────────────┘
-                 └────────┬─────────┘
-                          │
-         ┌────────────────┴────────────────┐
-         ▼                                 ▼
- (verify_passed == True)          (verify_retries >= 1)
-     finalize ──► END            deterministic_reply ──► END
+app/
+  main.py            FastAPI app
+  schemas.py         API + domain models
+  policy_config.py   typed access to policy_config.yaml
+  policy_config.yaml thresholds, severity order, windows, limits
+  agent/             schemas, tools, the loop
+  llm/               Gemini client, prompt builder, schema inliner
+  engine/            facts, matcher, ranking, verifier, policies
+  graph/             state, six nodes, routing, builder
+  guardrails/        patterns.yaml, templates.yaml
+  sops/              published policy YAML
+tools/               geocode, weather, sop_loader
+evals/               cases.yaml, fixtures, runner, RESULTS.md
+tests/               pytest suites
 ```
-
-1. **Fact & Citation Check**: `verify_reply` parses all numbers and SOP IDs in the LLM's generated reply using regex.
-2. **Re-prompting Loop**: If the LLM hallucinated a number or omitted an SOP citation, `route_after_verify` loops back to `compose_reply` for a re-prompt attempt.
-3. **Guaranteed Termination**: If verification fails a second time, the graph breaks out to `deterministic_reply`, ensuring zero hallucinations and guaranteed response delivery.
-
----
-
-## 🛡️ Security & Privacy Layer
-
-1. **PII Scrubbing**: `_scrub_pii()` in `guard_input` automatically detects and redacts:
-   - Email addresses $\rightarrow$ `[EMAIL_REDACTED]`
-   - Phone numbers $\rightarrow$ `[PHONE_REDACTED]`
-   - Credit Card / Aadhaar / SSN $\rightarrow$ `[SENSITIVE_ID_REDACTED]`
-2. **Prompt Injection Defense**: `INJECTION_PATTERNS` scans for jailbreak attempts (`developer mode`, `override sops`, `system prompt`, `<|im_start|>`) and flags them in the state.
-
----
-
-## 📊 Conflict Resolution & Ranking Engine
-
-When multiple SOPs match a query (e.g. high wind and high UV for cycling), `resolve_conflicts` ranks them using a deterministic 3-tier hierarchy:
-
-1. **Precedence**: `precedence: "override"` (e.g. severe rain/cyclone system) always takes priority over standard activity SOPs.
-2. **Severity Weight**:
-   - `critical` $\rightarrow$ Weight 5
-   - `high` $\rightarrow$ Weight 4
-   - `moderate` $\rightarrow$ Weight 3
-   - `low` $\rightarrow$ Weight 2
-   - `info` $\rightarrow$ Weight 1
-3. **Tie-Breaker**: Alphabetical sorting by SOP ID.
-
-The top-ranked SOP becomes the **Primary SOP**, and up to two additional SOPs are included as **Secondary SOPs**.
-
----
-
-## 🛠️ Technology Stack & Dependencies
-
-- **Backend**: FastAPI, Python 3.11+, Pydantic v2
-- **Agent Framework**: LangGraph with `MemorySaver`
-- **LLM Engine**: Official `google-genai` SDK with `GEMINI_API_KEY` (direct API integration, no gateway)
-- **Live APIs**: Open-Meteo Forecast & Open-Meteo Geocoding APIs (via `httpx`)
-- **Frontend**: React + Vite, Lucide Icons, Vanilla CSS Glassmorphism

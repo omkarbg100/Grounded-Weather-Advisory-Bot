@@ -23,3 +23,4 @@
   advice: >
     Weather conditions in {location} are favorable for outdoor activities with low weather risk (temperature {temp_c}°C, calm wind {wind_kmh} km/h, clear skies). Standard hydration and sun protection (UV index {uv_max}) apply. [GEN-FAVORABLE-OUTDOOR-01]
   tags: ["favorable", "safe", "clear", "cycling", "sports", "cricket", "swimming"]
+

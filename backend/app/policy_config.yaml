@@ -1,0 +1,118 @@
+# Engine policy configuration.
+#
+# Everything the deterministic engine used to hardcode as Python literals now
+# lives here, so tuning behaviour never requires a code change.
+# Loaded once by app/policy_config.py; validated on startup.
+
+# Ordering of severity levels. Rank is the list index, highest wins.
+severity_rank:
+  - critical
+  - high
+  - moderate
+  - low
+  - info
+
+# WMO weather codes that indicate a thunderstorm.
+thunderstorm_codes: [95, 96, 99]
+
+# Precipitation at or above this many mm counts as a "wet hour".
+wet_hour_mm: 0.1
+
+# Hourly slice lengths. `today`/`next_24h`/`next_48h` use span only; window
+# definitions below use start_hour when present.
+default_window_span_hours: 24
+
+# Local-clock hours treated as daytime for the is_daytime_window fact.
+daytime:
+  start_hour: 6
+  end_hour: 19
+
+# Named windows the LLM may request via get_forecast(time_window=...).
+# start_hour + span_hours describe an inclusive range of local hours.
+time_windows:
+  now:
+    description: Current conditions, the next few hours.
+    start_hour: 0
+    span_hours: 3
+    daytime: null
+  today:
+    description: The remainder of the current local day.
+    start_hour: 0
+    span_hours: 24
+    daytime: null
+  this_evening:
+    description: Tonight, typically 18:00 through 22:00 local time.
+    start_hour: 18
+    span_hours: 5
+    daytime: false
+  tomorrow:
+    description: The next full local day.
+    day_offset: 1
+    span_hours: 24
+    daytime: null
+  next_24h:
+    description: A rolling 24 hour period starting now.
+    start_hour: 0
+    span_hours: 24
+    daytime: null
+  next_48h:
+    description: A rolling 48 hour period starting now.
+    start_hour: 0
+    span_hours: 48
+    daytime: null
+  custom:
+    description: An explicit ISO-8601 start and end supplied by the caller.
+    daytime: null
+
+# Valid coordinate bounds enforced before any network call.
+coordinate_bounds:
+  latitude: [-90.0, 90.0]
+  longitude: [-180.0, 180.0]
+
+# Limits the LLM may choose within. Values are clamped, never rejected, unless
+# they fall outside these ranges entirely.
+weather_request:
+  forecast_days:
+    min: 1
+    max: 7
+    default: 2
+  timeout_seconds: 8.0
+  max_retries: 1
+  # Field allowlist for the Open-Meteo request. The model may change the
+  # forecast horizon but never the variables, so SOP fact names stay derivable.
+  current_fields:
+    - temperature_2m
+    - apparent_temperature
+    - wind_speed_10m
+    - wind_gusts_10m
+    - precipitation
+    - weather_code
+    - uv_index
+  hourly_fields:
+    - temperature_2m
+    - apparent_temperature
+    - precipitation
+    - precipitation_probability
+    - wind_speed_10m
+    - wind_gusts_10m
+    - uv_index
+    - weather_code
+  daily_fields:
+    - precipitation_sum
+    - precipitation_hours
+    - weather_code
+    - uv_index_max
+    - wind_gusts_10m_max
+  timezone: auto
+
+geocode_request:
+  max_results: 5
+  default_results: 3
+  timeout_seconds: 8.0
+  language: en
+
+# Agent execution limits.
+agent:
+  max_steps: 6
+  verify_repair_attempts: 1
+  max_history_messages: 24

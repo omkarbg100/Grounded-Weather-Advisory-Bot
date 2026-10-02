@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import List, Set, Union, Dict, Any
 import yaml
 
-from app.schemas import SOPModel, SOPRegistry, WhenGroup, SingleCondition, FuzzyScoring, FuzzyCriterion, ComparisonOp
+from app.schemas import SOPModel, SOPRegistry, WhenGroup, SingleCondition
 from app.engine.facts import KNOWN_FACT_NAMES
 from app.config import SOPS_DIR
 

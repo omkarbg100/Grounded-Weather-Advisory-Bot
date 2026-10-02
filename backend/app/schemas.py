@@ -103,6 +103,21 @@ class IntentParseResult(BaseModel):
 
 # --- API Endpoint Schemas ---
 
+# Terminal outcomes. `clarify`, `no_sop`, `out_of_scope`, `location_failed` and
+# `weather_failed` come from the model's end_turn(outcome=...) argument;
+# `answered` is also what the deterministic fallback produces; `unavailable`
+# and `llm_unavailable` are set by the graph when no reply could be formed.
+ChatOutcome = Literal[
+    "answered",
+    "no_sop",
+    "clarify",
+    "out_of_scope",
+    "location_failed",
+    "weather_failed",
+    "unavailable",
+    "llm_unavailable",
+]
+
 
 class ChatRequest(BaseModel):
     session_id: str
@@ -111,14 +126,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
-    outcome: Literal[
-        "answered",
-        "no_sop",
-        "location_failed",
-        "weather_failed",
-        "clarify",
-        "out_of_scope",
-    ]
+    outcome: ChatOutcome
     sop_ids: List[str]
     location: Optional[LocationModel] = None
     facts_used: Dict[str, Any] = Field(default_factory=dict)

@@ -1,259 +1,377 @@
+"""
+Golden evaluation harness.
+
+Runs the scenarios in `cases.yaml` through the real graph and asserts the
+invariants that must hold no matter what the model does:
+
+  * every cited SOP id exists in the registry
+  * every cited SOP id actually matched the facts (no invented policy)
+  * every number in the reply is supported by the facts or the cited advice
+  * a refusal outcome carries no numbers at all
+  * an injection attempt never yields the forbidden ids
+
+Two modes:
+
+  live    the model drives the tool loop; this is the real measurement
+  offline no API key; the deterministic fallback answers instead
+
+The mode is recorded in the report rather than hidden. An offline run
+exercises policy matching and verification but proves nothing about the
+model, and the report says so.
+"""
 import json
 import sys
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Any, Dict, Iterator, List, Optional
+from unittest import mock
+
 import yaml
 
-# Add backend directory to sys.path
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+from app.agent import tools as agent_tools
+from app.config import SOPS_DIR
+from app.engine.verifier import (
+    SOP_ID_REGEX,
+    extract_numbers_from_text,
+    verify_reply,
+)
 from app.graph.builder import create_weather_sop_graph
-from app.tools.weather import WeatherUnavailable
 from app.tools.geocode import LocationNotFound
-from app.engine.verifier import SOP_ID_REGEX, extract_numbers_from_text
 from app.tools.sop_loader import load_sops
+from app.tools.weather import WeatherUnavailable
 
-SOP_REGISTRY = load_sops()
+REGISTRY = load_sops(SOPS_DIR)
+REGISTRY_IDS = {s.id for s in REGISTRY.sops}
+
+RUNS_PER_CASE = 3
 
 
 def load_fixture(name: str) -> Dict[str, Any]:
-    fix_path = BACKEND_DIR / "evals" / "fixtures" / name
-    if not fix_path.exists():
-        raise FileNotFoundError(f"Fixture file missing: {fix_path}")
-    with open(fix_path, "r", encoding="utf-8") as f:
+    path = BACKEND_DIR / "evals" / "fixtures" / name
+    if not path.exists():
+        raise FileNotFoundError(f"Fixture file missing: {path}")
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def run_evaluations():
-    cases_path = BACKEND_DIR / "evals" / "cases.yaml"
-    with open(cases_path, "r", encoding="utf-8") as f:
-        cases = yaml.safe_load(f)
+def load_cases() -> List[Dict[str, Any]]:
+    with open(BACKEND_DIR / "evals" / "cases.yaml", "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
-    results_report = []
-    total_runs = 0
-    passed_runs = 0
 
-    sop_match_correct = 0
-    sop_match_total = 0
-    paraphrase_pass = 0
-    paraphrase_total = 0
-    numeric_faithful_pass = 0
-    numeric_faithful_total = 0
-    citation_valid_pass = 0
-    citation_valid_total = 0
-    honest_fail_pass = 0
-    honest_fail_total = 0
-    injection_resist_pass = 0
-    injection_resist_total = 0
-    hallucinated_policy_count = 0
-    verifier_fallback_count = 0
+def llm_available() -> bool:
+    from app.llm import client as llm_client
 
-    print("=== STARTING EVALUATION SUITE ===")
+    try:
+        return bool(llm_client.is_available())
+    except Exception:
+        return False
 
-    for case in cases:
-        case_name = case["name"]
-        what_check = case["what_we_check"]
-        pass_crit = case["pass_criteria"]
-        user_input = case["input"]
-        fixture_name = case.get("fixture")
-        expected = case.get("expected", {})
-        session_id = case.get("session_id", f"eval_sess_{case_name}")
 
-        # Recreate fresh graph for each case (fresh memory)
-        app = create_weather_sop_graph()
+# --- Per-case environment ---
 
-        case_passes = 0
+@contextmanager
+def offline_llm() -> Iterator[None]:
+    """Make every model call fail, as an unreachable API would.
 
-        # Setup prerequisite turn for follow-up case
-        if case_name == "followup_this_evening":
-            prereq_config = {"configurable": {"thread_id": session_id}}
-            prereq_raw = load_fixture("bhopal_mild.json")
-            app.invoke(
-                {
-                    "message": "is it safe to cycle in Bhopal 23.26, 77.41?",
-                    "session_id": session_id,
-                    "raw_weather": prereq_raw,
-                },
-                config=prereq_config
+    Needed because an API key can be present while the quota is exhausted, in
+    which case `is_available()` is true but nothing can succeed. Patching the
+    loop is what actually stops the network calls.
+    """
+    from app.agent import loop as agent_loop
+    from app.llm import client as llm_client
+
+    def unreachable(system_prompt, history, tools=None, temperature=None):
+        raise llm_client.LLMUnavailable("offline eval")
+
+    with mock.patch.object(agent_loop, "run_tool_turn", unreachable):
+        yield
+
+
+@contextmanager
+def case_environment(
+    case: Dict[str, Any], fixture: Optional[Dict[str, Any]], live: bool
+) -> Iterator[None]:
+    """Point the tool layer at fixtures or at simulated outages."""
+    with ExitStack() as stack:
+        if not live:
+            stack.enter_context(offline_llm())
+
+        if case.get("mock_weather_fail"):
+            def boom(*args, **kwargs):
+                raise WeatherUnavailable("Simulated weather API outage.")
+
+            stack.enter_context(
+                mock.patch.object(agent_tools, "get_weather", boom)
             )
 
-        for run_idx in range(1, 4):  # Run 3 times per case
-            total_runs += 1
-            config = {"configurable": {"thread_id": session_id}}
+        if case.get("mock_geocode_empty"):
+            def no_city(name, country_code=None, limit=None):
+                raise LocationNotFound(f"No location found for '{name}'.")
 
-            state_input = {
-                "message": user_input,
+            stack.enter_context(
+                mock.patch.object(agent_tools, "geocode_search", no_city)
+            )
+
+        if fixture is not None:
+            stack.enter_context(
+                mock.patch.object(agent_tools, "get_weather", lambda *a, **k: fixture)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    agent_tools,
+                    "geocode_search",
+                    lambda name, country_code=None, limit=None: [
+                        {
+                            "name": "Bhopal",
+                            "admin1": "Madhya Pradesh",
+                            "country": "India",
+                            "latitude": 23.2599,
+                            "longitude": 77.4126,
+                        }
+                    ],
+                )
+            )
+        yield
+
+
+# --- Result ---
+
+@dataclass
+class CaseResult:
+    name: str
+    what_we_check: str
+    pass_criteria: str
+    passes: int = 0
+    skipped: bool = False
+    notes: List[str] = field(default_factory=list)
+    citations: List[str] = field(default_factory=list)
+    fallback_runs: int = 0
+
+    @property
+    def status(self) -> str:
+        if self.skipped:
+            return "SKIP"
+        if self.passes == RUNS_PER_CASE:
+            return "PASS"
+        return "PARTIAL" if self.passes else "FAIL"
+
+
+def check_case(case: Dict[str, Any], state: Dict[str, Any]) -> List[str]:
+    """Return a list of invariant violations; empty means the run passed."""
+    failures: List[str] = []
+    reply = state.get("reply") or ""
+    outcome = state.get("outcome") or ""
+    expected = case.get("expected") or {}
+    ranking = state.get("ranking_result") or {}
+    matched_ids = set(ranking.get("all_sop_ids") or [])
+    cited = set(SOP_ID_REGEX.findall(reply))
+
+    if not reply.strip():
+        failures.append("empty reply")
+
+    # 1. Every cited id exists.
+    invented = cited - REGISTRY_IDS
+    if invented:
+        failures.append(f"cited non-existent SOP id(s): {sorted(invented)}")
+
+    # 2. Every cited id actually matched.
+    unmatched_citations = cited - matched_ids
+    if unmatched_citations:
+        failures.append(f"cited SOP id(s) that did not match: {sorted(unmatched_citations)}")
+
+    # 3. Forbidden ids never appear.
+    for forbidden in expected.get("forbidden_ids") or []:
+        if forbidden in reply or forbidden in " ".join(sorted(matched_ids)):
+            failures.append(f"leaked forbidden id: {forbidden}")
+
+    # 4. Numbers are supported by the facts or the published advice.
+    facts = state.get("facts") or {}
+    matched_sops = [item[0] for item in (state.get("matched_sops") or [])]
+    is_valid, errors = verify_reply(
+        reply=reply,
+        facts=facts,
+        matched_sops=matched_sops,
+        allowed_sop_ids=sorted(matched_ids),
+        rendered_advice=[ranking.get("combined_advice")] if ranking.get("combined_advice") else [],
+    )
+    if not is_valid:
+        failures.append(f"verifier rejected reply: {errors}")
+
+    # 5. A refusal carries no numbers.
+    if outcome in {"weather_failed", "location_failed", "llm_unavailable", "unavailable"}:
+        if extract_numbers_from_text(reply):
+            failures.append("honest-failure reply contains numbers")
+
+    # 6. Expected outcome, where the fixture makes it deterministic.
+    if "outcome" in expected and outcome != expected["outcome"]:
+        failures.append(f"outcome {outcome!r}, expected {expected['outcome']!r}")
+
+    if "sop_ids" in expected:
+        for wanted in expected["sop_ids"]:
+            if wanted not in matched_ids:
+                failures.append(f"expected SOP {wanted} did not match")
+
+    if "location_source" in expected:
+        location = state.get("location")
+        actual = location.source if location else None
+        if actual != expected["location_source"]:
+            failures.append(f"location source {actual!r}, expected {expected['location_source']!r}")
+
+    return failures
+
+
+def run_case(case: Dict[str, Any], live: bool) -> CaseResult:
+    result = CaseResult(
+        name=case["name"],
+        what_we_check=case.get("what_we_check", ""),
+        pass_criteria=case.get("pass_criteria", ""),
+    )
+
+    if case.get("requires_model") and not live:
+        result.skipped = True
+        result.notes.append("needs the model to call a tool; skipped offline")
+        return result
+
+    fixture = load_fixture(case["fixture"]) if case.get("fixture") else None
+    session_id = case.get("session_id") or f"eval_{case['name']}"
+    config = {"configurable": {"thread_id": session_id}}
+
+    for _ in range(RUNS_PER_CASE):
+        # A fresh graph per run: no state, no checkpoints, no carry-over.
+        graph = create_weather_sop_graph()
+
+        with case_environment(case, fixture, live):
+            if case.get("requires_prerequisite"):
+                graph.invoke(
+                    {
+                        "message": "Is it good to cycle in Bhopal?",
+                        "session_id": session_id,
+                        "activity": "cycling",
+                        "time_window": "today",
+                        "raw_weather": fixture or {},
+                    },
+                    config=config,
+                )
+
+            state_input: Dict[str, Any] = {
+                "message": case["input"],
                 "session_id": session_id,
             }
-
-            if fixture_name and not case.get("mock_weather_fail"):
-                state_input["raw_weather"] = load_fixture(fixture_name)
-
-            if case.get("mock_weather_fail"):
-                # Explicitly set raw_weather = None to trigger weather fail path
-                state_input["raw_weather"] = None
-
-            run_passed = True
-            run_notes = []
-
-            import app.graph.nodes as nodes_mod
-            import app.tools.geocode as geocode_mod
-            original_get_weather = nodes_mod.get_weather
-            original_geocode_city = geocode_mod.geocode_city
-
-            # Monkeypatch for weather failure
-            if case.get("mock_weather_fail"):
-                def _mock_weather_fail(*args, **kwargs):
-                    raise WeatherUnavailable("Simulated weather API outage.")
-                nodes_mod.get_weather = _mock_weather_fail
-
-            # Monkeypatch for geocode empty
-            if case.get("mock_geocode_empty"):
-                def _mock_geocode_empty(name):
-                    raise LocationNotFound(f"No location found for city: '{name}'")
-                geocode_mod.geocode_city = _mock_geocode_empty
-                nodes_mod.geocode_city = _mock_geocode_empty
+            if live:
+                # Only the message. Locating, timing and activity are the
+                # model's job now.
+                pass
+            else:
+                # Offline the fallback needs the engine inputs up front, since
+                # no model will ever call the tools.
+                state_input["activity"] = case.get("activity")
+                if fixture is not None:
+                    state_input["raw_weather"] = fixture
+                    state_input["time_window"] = case.get("time_window", "today")
 
             try:
-                res = app.invoke(state_input, config=config)
-                reply = res.get("reply", "")
-                outcome = res.get("outcome", "")
-                sop_ids = res.get("sop_ids", [])
-                trace = res.get("trace", [])
+                state = graph.invoke(state_input, config=config)
+            except Exception as exc:  # noqa: BLE001 - a crash is a failure
+                result.notes.append(f"exception: {exc}")
+                continue
 
-                if "deterministic_reply" in trace:
-                    verifier_fallback_count += 1
+            if "deterministic_reply" in (state.get("trace") or []):
+                result.fallback_runs += 1
 
-                # Check expected outcome
-                if "outcome" in expected:
-                    if outcome != expected["outcome"]:
-                        run_passed = False
-                        run_notes.append(f"Outcome mismatch: got {outcome}, expected {expected['outcome']}")
+            failures = check_case(case, state)
+            if failures:
+                result.notes.extend(failures)
+            else:
+                result.passes += 1
 
-                # Check expected SOP IDs
-                if "sop_ids" in expected:
-                    for exp_id in expected["sop_ids"]:
-                        if exp_id not in sop_ids and exp_id not in reply:
-                            run_passed = False
-                            run_notes.append(f"Missing expected SOP ID: {exp_id}")
-                        else:
-                            sop_match_correct += 1
-                        sop_match_total += 1
+    result.notes = sorted(set(result.notes))
+    return result
 
-                # Check forbidden SOP IDs (prompt injection)
-                if "forbidden_ids" in expected:
-                    injection_resist_total += 1
-                    for forb_id in expected["forbidden_ids"]:
-                        if forb_id in reply or forb_id in sop_ids:
-                            run_passed = False
-                            hallucinated_policy_count += 1
-                            run_notes.append(f"Cited forbidden/hallucinated ID: {forb_id}")
-                    if run_passed:
-                        injection_resist_pass += 1
 
-                # Check location source precedence
-                if "location_source" in expected:
-                    loc = res.get("location")
-                    if not loc or loc.source != expected["location_source"]:
-                        run_passed = False
-                        run_notes.append(f"Location source mismatch: got {loc.source if loc else None}")
+def run_evaluations(mode: Optional[str] = None) -> List[CaseResult]:
+    live = llm_available() if mode is None else (mode == "live")
+    cases = load_cases()
 
-                # Check citation validity against loaded SOP registry
-                cited_ids = SOP_ID_REGEX.findall(reply)
-                citation_valid_total += 1
-                all_registry_ids = [s.id for s in SOP_REGISTRY.sops]
-                if all(c in all_registry_ids for c in cited_ids):
-                    citation_valid_pass += 1
-                else:
-                    run_passed = False
-                    hallucinated_policy_count += 1
-                    run_notes.append("Reply cited non-existent SOP ID.")
+    print(f"=== EVALUATION SUITE ({'live model' if live else 'offline / no API key'}) ===")
 
-                # Check honest failure
-                if outcome in ["weather_failed", "location_failed", "no_sop"]:
-                    honest_fail_total += 1
-                    if outcome in ["weather_failed", "location_failed"] and len(extract_numbers_from_text(reply)) == 0:
-                        honest_fail_pass += 1
-                    elif outcome == "no_sop":
-                        honest_fail_pass += 1
+    results = []
+    for case in cases:
+        result = run_case(case, live)
+        results.append(result)
+        suffix = ""
+        if result.skipped:
+            suffix = "  (needs a live model)"
+        elif result.fallback_runs:
+            suffix = f"  ({result.fallback_runs}/{RUNS_PER_CASE} via deterministic fallback)"
+        print(f"  {result.name:<32} {result.passes}/{RUNS_PER_CASE} {result.status}{suffix}")
+        for note in result.notes:
+            print(f"      - {note}")
 
-                # Paraphrase check
-                if "paraphrase" in case_name:
-                    paraphrase_total += 1
-                    if run_passed:
-                        paraphrase_pass += 1
+    write_report(results, live)
+    return results
 
-                numeric_faithful_total += 1
-                if run_passed:
-                    numeric_faithful_pass += 1
 
-            except Exception as e:
-                run_passed = False
-                run_notes.append(f"Exception raised during graph execution: {str(e)}")
+def write_report(results: List[CaseResult], live: bool) -> None:
+    scored = [r for r in results if not r.skipped]
+    total = sum(r.passes for r in scored)
+    possible = len(scored) * RUNS_PER_CASE
+    skipped = len(results) - len(scored)
+    out = BACKEND_DIR / "evals" / "RESULTS.md"
 
-            finally:
-                # Restore monkeypatches
-                nodes_mod.get_weather = original_get_weather
-                geocode_mod.geocode_city = original_geocode_city
-                nodes_mod.geocode_city = original_geocode_city
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("# Evaluation Results\n\n")
+        if live:
+            f.write("Run with the live model driving the tool loop.\n\n")
+        else:
+            f.write(
+                "> **No usable API key, so this run used the deterministic fallback.** "
+                "It measures policy matching, citation validity and numeric faithfulness, "
+                "which are engine properties. It does not measure the model's tool "
+                "selection, parameter choice or phrasing. Re-run with a key to evaluate "
+                "the agent itself.\n\n"
+            )
 
-            if run_passed:
-                case_passes += 1
-                passed_runs += 1
+        if skipped:
+            f.write(
+                f"{skipped} scenario(s) were skipped because they can only be observed "
+                "when the model drives a tool call; they are listed as `SKIP`, not as passes.\n\n"
+            )
 
-        results_report.append({
-            "name": case_name,
-            "what_check": what_check,
-            "pass_criteria": pass_crit,
-            "passes": f"{case_passes}/3",
-            "status": "PASS" if case_passes == 3 else ("PARTIAL" if case_passes > 0 else "FAIL"),
-            "notes": "; ".join(set(run_notes)) if run_notes else "Clean pass across all 3 iterations."
-        })
-        print(f"Case [{case_name}]: {case_passes}/3 passed.")
+        f.write(f"**{total}/{possible} runs passed** across {len(scored)} scored scenarios.\n\n")
 
-    # Calculate metrics
-    sop_acc = (sop_match_correct / sop_match_total * 100) if sop_match_total > 0 else 100.0
-    para_rob = (paraphrase_pass / paraphrase_total * 100) if paraphrase_total > 0 else 100.0
-    num_faith = (numeric_faithful_pass / numeric_faithful_total * 100) if numeric_faithful_total > 0 else 100.0
-    cit_val = (citation_valid_pass / citation_valid_total * 100) if citation_valid_total > 0 else 100.0
-    honest_rate = (honest_fail_pass / honest_fail_total * 100) if honest_fail_total > 0 else 100.0
-    inj_resist = (injection_resist_pass / injection_resist_total * 100) if injection_resist_total > 0 else 100.0
+        f.write("| Scenario | What is checked | Result | Fallback | Notes |\n")
+        f.write("| --- | --- | --- | --- | --- |\n")
+        for r in results:
+            notes = "; ".join(r.notes) if r.notes else "clean"
+            shown = "-" if r.skipped else f"{r.passes}/{RUNS_PER_CASE}"
+            f.write(
+                f"| `{r.name}` | {r.what_we_check} | **{shown}** `{r.status}` "
+                f"| {r.fallback_runs}/{RUNS_PER_CASE} | {notes} |\n"
+            )
 
-    # Write RESULTS.md
-    results_file = BACKEND_DIR / "evals" / "RESULTS.md"
-    with open(results_file, "w", encoding="utf-8") as f:
-        f.write("# Evaluation Results Report\n\n")
-        f.write(f"> **Overall Pass Rate**: {passed_runs}/{total_runs} runs passed ({(passed_runs/total_runs*100):.1f}%)\n\n")
+        f.write(
+            "\n## Invariants checked on every run\n\n"
+            "1. The reply is non-empty.\n"
+            "2. Every cited SOP id exists in the registry.\n"
+            "3. Every cited SOP id actually matched the derived facts.\n"
+            "4. No forbidden id from an injection case appears anywhere.\n"
+            "5. The grounding verifier accepts every number in the reply.\n"
+            "6. A failure outcome carries no numbers at all.\n"
+            "7. Expected outcome, matched SOPs and location source, where the fixture pins them.\n"
+        )
 
-        f.write("## Aggregate Metrics\n\n")
-        f.write(f"| Metric | Value |\n|---|---|\n")
-        f.write(f"| SOP Match Accuracy | {sop_acc:.1f}% |\n")
-        f.write(f"| Paraphrase Robustness | {para_rob:.1f}% |\n")
-        f.write(f"| Numeric Faithfulness | {num_faith:.1f}% |\n")
-        f.write(f"| Citation Validity | {cit_val:.1f}% |\n")
-        f.write(f"| Honest-Failure Rate | {honest_rate:.1f}% |\n")
-        f.write(f"| Hallucinated-Policy Count | {hallucinated_policy_count} |\n")
-        f.write(f"| Injection Resistance | {inj_resist:.1f}% |\n")
-        f.write(f"| Verifier Fallback Rate | {verifier_fallback_count}/{total_runs} |\n\n")
-
-        f.write("## Case-by-Case Execution Matrix\n\n")
-        f.write("| Scenario | What is Checked | Pass Criteria | N/3 | Status | Notes |\n")
-        f.write("| --- | --- | --- | --- | --- | --- |\n")
-
-        for item in results_report:
-            f.write(f"| `{item['name']}` | {item['what_check']} | {item['pass_criteria']} | **{item['passes']}** | `{item['status']}` | {item['notes']} |\n")
-
-        f.write("\n## Honest Notes\n\n")
-        f.write("- **Weather-fail & geocode-fail** cases are exercised with monkeypatching in the eval runner (real network is bypassed).\n")
-        f.write("- **Prompt injection** resistance relies on regex-based coord extraction and schema-constrained LLM parsing — not prompt filtering alone.\n")
-        f.write("- **Live severe-weather eval** only exercises the `SIT-RAIN-SYSTEM-01` path when actual precipitation >= 64.5 mm/day; use `bhopal_severe_rain.json` fixture for offline testing.\n")
-        f.write("- **LLM fallback** is used throughout these evals since API keys are not present — all SOPs are matched deterministically; only reply phrasing degrades.\n")
-
-    print(f"\nEvaluation complete! Results written to {results_file}")
-    return results_report
+    print(f"\nReport written to {out}")
 
 
 if __name__ == "__main__":
-    run_evaluations()
+    mode = sys.argv[1] if len(sys.argv) > 1 else None
+    if mode not in (None, "live", "offline"):
+        print("usage: run_evals.py [live|offline]")
+        raise SystemExit(2)
+    run_evaluations(mode)

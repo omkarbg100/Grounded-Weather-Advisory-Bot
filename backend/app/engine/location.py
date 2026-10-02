@@ -1,6 +1,6 @@
 import re
 from typing import Optional, Tuple, Dict, Any
-from app.schemas import LocationModel, LocationSource
+from app.schemas import LocationModel
 
 
 COORD_REGEXES = [

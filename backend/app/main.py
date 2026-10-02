@@ -1,20 +1,21 @@
+from typing import Any, Dict, List
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
 
-from app.schemas import ChatRequest, ChatResponse, SOPSummary, LocationModel
 from app.graph.builder import graph_app
 from app.graph.nodes import SOP_REGISTRY
-
-from app.config import CORS_ORIGINS
+from app.schemas import ChatRequest, ChatResponse, SOPSummary
 
 app = FastAPI(
     title="Weather-SOP Advisory Bot API",
-    description="Deterministic SOP-grounded weather safety advisory chatbot API",
-    version="1.0.0"
+    description=(
+        "SOP-grounded weather safety advisory chatbot. The model chooses tool "
+        "arguments; all safety policy is evaluated deterministically."
+    ),
+    version="2.0.0",
 )
 
-# Configure CORS for all origins
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,10 +27,13 @@ app.add_middleware(
 
 @app.get("/health")
 def health_check():
+    from app.llm.client import is_available
+
     return {
         "status": "ok",
         "sops_loaded": len(SOP_REGISTRY.sops),
         "taxonomy": SOP_REGISTRY.taxonomy,
+        "llm_available": is_available(),
     }
 
 
@@ -39,7 +43,7 @@ def list_sops():
     for sop in SOP_REGISTRY.sops:
         advice_str = sop.advice or ""
         if not advice_str and sop.scoring:
-            advice_str = " / ".join([b.advice for b in sop.scoring.bands])
+            advice_str = " / ".join([band.advice for band in sop.scoring.bands])
 
         summaries.append(
             SOPSummary(
@@ -63,38 +67,35 @@ def chat_endpoint(req: ChatRequest):
         raise HTTPException(status_code=400, detail="Session ID cannot be empty.")
 
     config = {"configurable": {"thread_id": req.session_id.strip()}}
-
-    initial_input = {
+    initial_input: Dict[str, Any] = {
         "session_id": req.session_id.strip(),
         "message": req.message.strip(),
     }
 
     try:
         final_state = graph_app.invoke(initial_input, config=config)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Graph execution error: {str(e)}") from e
-
-    # Extract response fields
-    reply = final_state.get("reply", "No response generated.")
-    outcome = final_state.get("outcome", "answered")
-
-    ranking = final_state.get("ranking_result", {})
-    sop_ids = ranking.get("all_sop_ids", [])
-    if not sop_ids and final_state.get("matched_sops"):
-        sop_ids = [s[0].id for s in final_state.get("matched_sops", [])]
-
-    location = final_state.get("location")
-    facts_used = final_state.get("facts", {})
-    trace = final_state.get("trace", [])
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Graph execution error: {exc}"
+        ) from exc
 
     return ChatResponse(
-        reply=reply,
-        outcome=outcome,
-        sop_ids=sop_ids,
-        location=location,
-        facts_used=facts_used,
-        trace=trace,
+        reply=final_state.get("reply", ""),
+        outcome=final_state.get("outcome", "unavailable"),
+        sop_ids=_sop_ids(final_state),
+        location=final_state.get("location"),
+        facts_used=final_state.get("facts") or {},
+        trace=final_state.get("trace") or [],
     )
+
+
+def _sop_ids(state: Dict[str, Any]) -> List[str]:
+    ranking = state.get("ranking_result") or {}
+    ids = ranking.get("all_sop_ids") or []
+    if ids:
+        return list(ids)
+    return [sop.id for sop, _ in (state.get("matched_sops") or [])]
+
 
 @app.get("/")
 def root():
@@ -103,4 +104,3 @@ def root():
         "service": "weather-sop-advisory-bot",
         "docs": "/docs",
     }
-
