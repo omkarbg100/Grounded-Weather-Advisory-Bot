@@ -95,3 +95,12 @@ def chat_endpoint(req: ChatRequest):
         facts_used=facts_used,
         trace=trace,
     )
+
+@app.get("/")
+def root():
+    return {
+        "status": "healthy",
+        "service": "weather-sop-advisory-bot",
+        "docs": "/docs",
+    }
+
